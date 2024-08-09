@@ -4,7 +4,7 @@ import sys
 import torch
 from termcolor import colored
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
-from datasets import load_dataset, set_caching_enabled
+from datasets import load_dataset, DatasetDict, set_caching_enabled
 from huggingface_hub import HfApi, HfFolder, Repository
 import logging
 import configparser
@@ -45,7 +45,14 @@ def get_dataset_params(config):
 # Load the dataset
 def load_dataset_from_hub():
     dataset = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K")
-    return dataset["train"], dataset["validation"]
+    train_dataset = dataset["train"]
+
+    # Split the train dataset into train and validation
+    train_val_split = train_dataset.train_test_split(test_size=0.1)
+    train_dataset = train_val_split["train"]
+    val_dataset = train_val_split["test"]
+
+    return train_dataset, val_dataset
 
 # Load a pre-trained model and tokenizer
 def load_model_and_tokenizer(model_name, num_classes):
