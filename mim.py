@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Mistral API credentials and endpoint
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "ZLtWpfzof2FfNJK3AnZjz3yy0ljFR4J7")
-MISTRAL_API_URL = "https://api.mistral.ai/v1/suggestions"
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 def install_package(package: str) -> None:
     """Install a package using pip."""
