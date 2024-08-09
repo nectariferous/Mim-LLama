@@ -1,20 +1,19 @@
 import os
 import subprocess
 import sys
-import torch
-from termcolor import colored
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
-from datasets import load_dataset, set_caching_enabled
-from huggingface_hub import HfApi, HfFolder, Repository
+import requests
+import time
 import logging
 import configparser
-import warnings
+from termcolor import colored
 
-# Suppress the warning about weights not being initialized
-warnings.filterwarnings("ignore", message="Some weights of")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Set cache disabled to avoid slowdowns
-set_caching_enabled(False)
+# Mistral API credentials and endpoint
+MISTRAL_API_KEY = "ZLtWpfzof2FfNJK3AnZjz3yy0ljFR4J7"
+MISTRAL_API_URL = "https://api.mistral.ai/v1/suggestions"
 
 # Function to install required packages
 def install_package(package):
@@ -27,97 +26,43 @@ def install_required_packages(config):
         try:
             __import__(package)
         except ImportError:
-            print(colored(f"Installing {package}...", "yellow"))
+            logger.info(colored(f"Installing {package}...", "yellow"))
             install_package(package)
 
-# Define the paths and model names
-def get_paths_and_model_names(config):
-    output_dir = config["DEFAULT"]["output_dir"]
-    mini_model_name = config["DEFAULT"]["mini_model_name"]
-    return output_dir, mini_model_name
+# Function to get suggestions from Mistral API
+def get_suggestions(terminal_output):
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "input": terminal_output
+    }
+    response = requests.post(MISTRAL_API_URL, headers=headers, json=data)
+    if response.status_code == 200:
+        return response.json().get("suggestions", [])
+    else:
+        logger.error(colored(f"Error getting suggestions: {response.text}", "red"))
+        return []
 
-# Define the dataset parameters
-def get_dataset_params(config):
-    max_sequence_length = int(config["DEFAULT"]["max_sequence_length"])
-    num_classes = int(config["DEFAULT"]["num_classes"])
-    return max_sequence_length, num_classes
+# Function to apply suggestions to files
+def apply_suggestions(suggestions):
+    for suggestion in suggestions:
+        file_path = suggestion.get("file_path")
+        line_number = suggestion.get("line_number")
+        new_content = suggestion.get("new_content")
+        if file_path and line_number is not None and new_content:
+            with open(file_path, "r") as file:
+                lines = file.readlines()
+            lines[line_number - 1] = new_content + "\n"
+            with open(file_path, "w") as file:
+                file.writelines(lines)
+            logger.info(colored(f"Applied suggestion to {file_path} at line {line_number}", "green"))
 
-# Load the dataset
-def load_dataset_from_hub():
-    dataset = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K")
-    train_dataset = dataset["train"]
-
-    # Split the train dataset into train and validation
-    train_val_split = train_dataset.train_test_split(test_size=0.1)
-    train_dataset = train_val_split["train"]
-    val_dataset = train_val_split["test"]
-
-    return train_dataset, val_dataset
-
-# Load a pre-trained model and tokenizer
-def load_model_and_tokenizer(model_name, num_classes):
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_classes)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, clean_up_tokenization_spaces=True)
-    return model, tokenizer
-
-# Tokenize the datasets
-def tokenize_function(examples, tokenizer, max_sequence_length):
-    return tokenizer(examples["instruction"], padding="max_length", truncation=True, max_length=max_sequence_length)
-
-# Create a training arguments object
-def create_training_args(config):
-    output_dir = config["DEFAULT"]["output_dir"]
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=int(config["DEFAULT"]["num_train_epochs"]),
-        per_device_train_batch_size=int(config["DEFAULT"]["per_device_train_batch_size"]),
-        per_device_eval_batch_size=int(config["DEFAULT"]["per_device_eval_batch_size"]),
-        eval_strategy=config["DEFAULT"]["evaluation_strategy"],
-        save_strategy=config["DEFAULT"]["save_strategy"],
-        learning_rate=float(config["DEFAULT"]["learning_rate"]),
-        save_total_limit=int(config["DEFAULT"]["save_total_limit"]),
-        load_best_model_at_end=config["DEFAULT"]["load_best_model_at_end"].lower() == "true",
-        metric_for_best_model=config["DEFAULT"]["metric_for_best_model"],
-        greater_is_better=config["DEFAULT"]["greater_is_better"].lower() == "true",
-        fp16=True,  # Enable mixed-precision training
-        report_to="none",  # Disable wandb logging
-    )
-    return training_args
-
-# Define a compute_metrics function
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = torch.argmax(logits, dim=-1)
-    return {"accuracy": (predictions == labels).float().mean().item()}
-
-# Train the model
-def train_model(model, tokenized_train, tokenized_val, training_args, compute_metrics):
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,
-        compute_metrics=compute_metrics,
-    )
-    trainer.train()
-
-# Save the model and tokenizer
-def save_model_and_tokenizer(model, tokenizer, output_dir, mini_model_name):
-    model_save_path = os.path.join(output_dir, mini_model_name)
-    model.save_pretrained(model_save_path)
-    tokenizer.save_pretrained(model_save_path)
-    print(colored(f"Model saved to {model_save_path}", "green"))
-
-# Upload the model to Hugging Face
-def upload_model_to_hugging_face(model_save_path, mini_model_name):
-    print(colored("Uploading the model to Hugging Face...", "green"))
-    api = HfApi()
-    hf_folder = HfFolder()
-    repo_name = mini_model_name
-    repo_url = api.create_repo(repo_name)
-    repo = Repository(local_dir=model_save_path, clone_from=repo_url)
-    repo.push_to_hub()
-    print(colored(f"Model uploaded to {repo_url}", "green"))
+# Function to capture terminal output
+def capture_terminal_output(command):
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return result.stdout
 
 # Main function
 def main():
@@ -126,7 +71,7 @@ def main():
     try:
         config.read("config.ini")
     except configparser.ParsingError as e:
-        print(colored(f"Error parsing config.ini: {e}", "red"))
+        logger.error(colored(f"Error parsing config.ini: {e}", "red"))
         sys.exit(1)
 
     # Install required packages
@@ -149,20 +94,42 @@ def main():
     model, tokenizer = load_model_and_tokenizer(model_name, num_classes)
 
     # Tokenize the datasets using multi-processing
-    tokenized_train = train_dataset.map(lambda examples: tokenize_function(examples, tokenizer, max_sequence_length), batched=True, num_proc=os.cpu_count())
-    tokenized_val = val_dataset.map(lambda examples: tokenize_function(examples, tokenizer, max_sequence_length), batched=True, num_proc=os.cpu_count())
+    try:
+        tokenized_train = train_dataset.map(lambda examples: tokenize_function(examples, tokenizer, max_sequence_length), batched=True, num_proc=os.cpu_count())
+        tokenized_val = val_dataset.map(lambda examples: tokenize_function(examples, tokenizer, max_sequence_length), batched=True, num_proc=os.cpu_count())
+    except Exception as e:
+        logger.error(colored(f"Error during tokenization: {e}", "red"))
+        sys.exit(1)
 
     # Create a training arguments object
     training_args = create_training_args(config)
 
     # Train the model
-    train_model(model, tokenized_train, tokenized_val, training_args, compute_metrics)
+    try:
+        train_model(model, tokenized_train, tokenized_val, training_args, compute_metrics)
+    except Exception as e:
+        logger.error(colored(f"Error during training: {e}", "red"))
+        sys.exit(1)
 
     # Save the model and tokenizer
     save_model_and_tokenizer(model, tokenizer, output_dir, mini_model_name)
 
     # Upload the model to Hugging Face
     upload_model_to_hugging_face(os.path.join(output_dir, mini_model_name), mini_model_name)
+
+    # Automated loop for suggestions and edits
+    while True:
+        # Capture terminal output
+        terminal_output = capture_terminal_output("python mim.py")
+
+        # Get suggestions from Mistral API
+        suggestions = get_suggestions(terminal_output)
+
+        # Apply suggestions to files
+        apply_suggestions(suggestions)
+
+        # Wait before re-running the script
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
