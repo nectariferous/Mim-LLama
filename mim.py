@@ -4,7 +4,7 @@ import sys
 import torch
 from termcolor import colored
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
-from datasets import load_dataset, DatasetDict, set_caching_enabled
+from datasets import load_dataset, set_caching_enabled
 from huggingface_hub import HfApi, HfFolder, Repository
 import logging
 import configparser
@@ -62,7 +62,7 @@ def load_model_and_tokenizer(model_name, num_classes):
 
 # Tokenize the datasets
 def tokenize_function(examples, tokenizer, max_sequence_length):
-    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=max_sequence_length)
+    return tokenizer(examples["instruction"], padding="max_length", truncation=True, max_length=max_sequence_length)
 
 # Create a training arguments object
 def create_training_args(config):
