@@ -1,14 +1,19 @@
 import os
 import subprocess
 import sys
-import torch
-from termcolor import colored
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
-from datasets import load_dataset, set_caching_enabled
-from huggingface_hub import HfApi, HfFolder, Repository
+import requests
+import time
 import logging
 import configparser
 import warnings
+from termcolor import colored
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any
+from tqdm import tqdm
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
+from datasets import load_dataset, set_caching_enabled
+from huggingface_hub import HfApi, HfFolder, Repository
 
 # Suppress the warning about weights not being initialized
 warnings.filterwarnings("ignore", message="Some weights of")
@@ -16,34 +21,89 @@ warnings.filterwarnings("ignore", message="Some weights of")
 # Set cache disabled to avoid slowdowns
 set_caching_enabled(False)
 
-# Function to install required packages
-def install_package(package):
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Mistral API credentials and endpoint
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "ZLtWpfzof2FfNJK3AnZjz3yy0ljFR4J7")
+MISTRAL_API_URL = "https://api.mistral.ai/v1/suggestions"
+
+def install_package(package: str) -> None:
+    """Install a package using pip."""
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
-# Ensure required packages are installed
-def install_required_packages(config):
+def install_required_packages(config: configparser.ConfigParser) -> None:
+    """Ensure required packages are installed."""
     required_packages = config["DEFAULT"]["required_packages"].split(",")
-    for package in required_packages:
-        try:
-            __import__(package)
-        except ImportError:
-            print(colored(f"Installing {package}...", "yellow"))
-            install_package(package)
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = [executor.submit(install_package, package.strip()) for package in required_packages if not is_package_installed(package.strip())]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Installing packages"):
+            future.result()
 
-# Define the paths and model names
-def get_paths_and_model_names(config):
+def is_package_installed(package: str) -> bool:
+    """Check if a package is already installed."""
+    try:
+        __import__(package)
+        return True
+    except ImportError:
+        return False
+
+def get_suggestions(terminal_output: str) -> List[Dict[str, Any]]:
+    """Get suggestions from Mistral API."""
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {"input": terminal_output}
+    try:
+        response = requests.post(MISTRAL_API_URL, headers=headers, json=data, timeout=10)
+        response.raise_for_status()
+        return response.json().get("suggestions", [])
+    except requests.RequestException as e:
+        logger.error(colored(f"Error getting suggestions: {e}", "red"))
+        return []
+
+def apply_suggestions(suggestions: List[Dict[str, Any]]) -> None:
+    """Apply suggestions to files."""
+    for suggestion in suggestions:
+        file_path = suggestion.get("file_path")
+        line_number = suggestion.get("line_number")
+        new_content = suggestion.get("new_content")
+        if all([file_path, line_number is not None, new_content]):
+            try:
+                with open(file_path, "r") as file:
+                    lines = file.readlines()
+                lines[line_number - 1] = new_content + "\n"
+                with open(file_path, "w") as file:
+                    file.writelines(lines)
+                logger.info(colored(f"Applied suggestion to {file_path} at line {line_number}", "green"))
+            except IOError as e:
+                logger.error(colored(f"Error applying suggestion to {file_path}: {e}", "red"))
+
+def capture_terminal_output(command: str) -> str:
+    """Capture terminal output from a command."""
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        logger.warning(colored(f"Command timed out: {command}", "yellow"))
+        return ""
+
+def get_paths_and_model_names(config: configparser.ConfigParser) -> tuple:
+    """Define the paths and model names."""
     output_dir = config["DEFAULT"]["output_dir"]
     mini_model_name = config["DEFAULT"]["mini_model_name"]
     return output_dir, mini_model_name
 
-# Define the dataset parameters
-def get_dataset_params(config):
+def get_dataset_params(config: configparser.ConfigParser) -> tuple:
+    """Define the dataset parameters."""
     max_sequence_length = int(config["DEFAULT"]["max_sequence_length"])
     num_classes = int(config["DEFAULT"]["num_classes"])
     return max_sequence_length, num_classes
 
-# Load the dataset
 def load_dataset_from_hub():
+    """Load the dataset."""
     dataset = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K")
     train_dataset = dataset["train"]
 
@@ -54,20 +114,20 @@ def load_dataset_from_hub():
 
     return train_dataset, val_dataset
 
-# Load a pre-trained model and tokenizer
-def load_model_and_tokenizer(model_name, num_classes):
+def load_model_and_tokenizer(model_name: str, num_classes: int) -> tuple:
+    """Load a pre-trained model and tokenizer."""
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_classes)
     tokenizer = AutoTokenizer.from_pretrained(model_name, clean_up_tokenization_spaces=True)
     return model, tokenizer
 
-# Tokenize the datasets
-def tokenize_function(examples, tokenizer, max_sequence_length):
+def tokenize_function(examples: Dict[str, Any], tokenizer: AutoTokenizer, max_sequence_length: int) -> Dict[str, Any]:
+    """Tokenize the datasets."""
     return tokenizer(examples["instruction"], padding="max_length", truncation=True, max_length=max_sequence_length)
 
-# Create a training arguments object
-def create_training_args(config):
+def create_training_args(config: configparser.ConfigParser) -> TrainingArguments:
+    """Create a training arguments object."""
     output_dir = config["DEFAULT"]["output_dir"]
-    training_args = TrainingArguments(
+    return TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=int(config["DEFAULT"]["num_train_epochs"]),
         per_device_train_batch_size=int(config["DEFAULT"]["per_device_train_batch_size"]),
@@ -82,16 +142,15 @@ def create_training_args(config):
         fp16=True,  # Enable mixed-precision training
         report_to="none",  # Disable wandb logging
     )
-    return training_args
 
-# Define a compute_metrics function
-def compute_metrics(eval_pred):
+def compute_metrics(eval_pred: tuple) -> Dict[str, float]:
+    """Define a compute_metrics function."""
     logits, labels = eval_pred
     predictions = torch.argmax(logits, dim=-1)
     return {"accuracy": (predictions == labels).float().mean().item()}
 
-# Train the model
-def train_model(model, tokenized_train, tokenized_val, training_args, compute_metrics):
+def train_model(model: AutoModelForSequenceClassification, tokenized_train: Any, tokenized_val: Any, training_args: TrainingArguments, compute_metrics: callable) -> None:
+    """Train the model."""
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -101,32 +160,31 @@ def train_model(model, tokenized_train, tokenized_val, training_args, compute_me
     )
     trainer.train()
 
-# Save the model and tokenizer
-def save_model_and_tokenizer(model, tokenizer, output_dir, mini_model_name):
+def save_model_and_tokenizer(model: AutoModelForSequenceClassification, tokenizer: AutoTokenizer, output_dir: str, mini_model_name: str) -> None:
+    """Save the model and tokenizer."""
     model_save_path = os.path.join(output_dir, mini_model_name)
     model.save_pretrained(model_save_path)
     tokenizer.save_pretrained(model_save_path)
-    print(colored(f"Model saved to {model_save_path}", "green"))
+    logger.info(colored(f"Model saved to {model_save_path}", "green"))
 
-# Upload the model to Hugging Face
-def upload_model_to_hugging_face(model_save_path, mini_model_name):
-    print(colored("Uploading the model to Hugging Face...", "green"))
+def upload_model_to_hugging_face(model_save_path: str, mini_model_name: str) -> None:
+    """Upload the model to Hugging Face."""
+    logger.info(colored("Uploading the model to Hugging Face...", "green"))
     api = HfApi()
-    hf_folder = HfFolder()
     repo_name = mini_model_name
     repo_url = api.create_repo(repo_name)
     repo = Repository(local_dir=model_save_path, clone_from=repo_url)
     repo.push_to_hub()
-    print(colored(f"Model uploaded to {repo_url}", "green"))
+    logger.info(colored(f"Model uploaded to {repo_url}", "green"))
 
-# Main function
-def main():
+def main() -> None:
+    """Main function to run the Model Improvement Module."""
     # Load configuration
     config = configparser.ConfigParser()
     try:
         config.read("config.ini")
     except configparser.ParsingError as e:
-        print(colored(f"Error parsing config.ini: {e}", "red"))
+        logger.error(colored(f"Error parsing config.ini: {e}", "red"))
         sys.exit(1)
 
     # Install required packages
@@ -164,5 +222,25 @@ def main():
     # Upload the model to Hugging Face
     upload_model_to_hugging_face(os.path.join(output_dir, mini_model_name), mini_model_name)
 
+    # Automated loop for suggestions and edits
+    while True:
+        # Capture terminal output
+        terminal_output = capture_terminal_output("python mim.py")
+
+        # Get suggestions from Mistral API
+        suggestions = get_suggestions(terminal_output)
+
+        # Apply suggestions to files
+        apply_suggestions(suggestions)
+
+        # Wait before re-running the script
+        time.sleep(5)
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info(colored("Script terminated by user.", "yellow"))
+    except Exception as e:
+        logger.error(colored(f"An unexpected error occurred: {e}", "red"))
+        sys.exit(1)
